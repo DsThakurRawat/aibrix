@@ -29,6 +29,7 @@ import (
 	"time"
 
 	miniredis "github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
@@ -1173,4 +1174,50 @@ func TestScheduleRunningRequestsHygiene_RepairsDriftedField(t *testing.T) {
 	got, err := client.HGet(ctx, key, own).Result()
 	require.NoError(t, err)
 	require.Equal(t, "0", got)
+}
+
+// aibrix_gateway_running_requests_admit_fallback_total is the production signal that the
+// local-count fallback decided an admission (see incAdmitFallback): a failed Redis round
+// trip increments eval_error, a reply that does not match the script's contract increments
+// bad_reply, and a clean script run increments nothing.
+func TestAdmitRunningRequest_FallbackCounterRecordsReason(t *testing.T) {
+	initAdmitFallbackMetrics()
+	require.NotNil(t, admitFallbackTotal)
+	count := func(reason string) float64 {
+		return testutil.ToFloat64(admitFallbackTotal.WithLabelValues(reason))
+	}
+
+	// eval_error: the admit script fails before it is sent, as a refused connection does.
+	evalClient := newTestRunningRequestsClient(t)
+	evalClient.AddHook(admitScriptHook{run: false, process: failAdmitScript})
+	evalStore := &Store{redisClient: evalClient}
+	evalBefore := count(admitFallbackReasonEvalError)
+	admitted, counted, _ := evalStore.admitRunningRequest(testNamespace, testPodName, 2, 0)
+	require.True(t, admitted)
+	require.False(t, counted)
+	require.Equal(t, float64(1), count(admitFallbackReasonEvalError)-evalBefore)
+
+	// bad_reply: Redis answers with a reply the script would never produce.
+	replyClient := newTestRunningRequestsClient(t)
+	replyClient.AddHook(admitScriptHook{process: func(cmd *redis.Cmd) error {
+		cmd.SetVal(int64(1))
+		return nil
+	}})
+	replyStore := &Store{redisClient: replyClient}
+	replyBefore := count(admitFallbackReasonBadReply)
+	admitted, counted, _ = replyStore.admitRunningRequest(testNamespace, testPodName, 2, 0)
+	require.True(t, admitted)
+	require.False(t, counted)
+	require.Equal(t, float64(1), count(admitFallbackReasonBadReply)-replyBefore)
+
+	// A confirmed script run is not a fallback.
+	cleanClient := newTestRunningRequestsClient(t)
+	cleanStore := &Store{redisClient: cleanClient}
+	seedLiveGateway(t, cleanClient)
+	evalBefore, replyBefore = count(admitFallbackReasonEvalError), count(admitFallbackReasonBadReply)
+	admitted, counted, _ = cleanStore.admitRunningRequest(testNamespace, testPodName, 2, 0)
+	require.True(t, admitted)
+	require.True(t, counted)
+	require.Zero(t, count(admitFallbackReasonEvalError)-evalBefore)
+	require.Zero(t, count(admitFallbackReasonBadReply)-replyBefore)
 }

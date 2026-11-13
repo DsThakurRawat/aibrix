@@ -1,0 +1,17 @@
+# E2E-only verbosity: run the gateway at -v=4 so the running-requests admission
+# fallback line ("failed to atomically admit against running-requests inflight cap;
+# falling back to local count", logged at klog.V(4)) lands in the diagnose step's
+# gateway logs and a future inflight-cap flake can be attributed to the fallback
+# path instead of guessed at. Production manifests keep the default verbosity.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aibrix-gateway-plugins
+  namespace: aibrix-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: gateway-plugin
+        args:
+        - -v=4

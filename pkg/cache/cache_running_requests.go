@@ -347,6 +347,7 @@ func (c *Store) admitRunningRequest(namespace, name string, limit, localRunning 
 		runningRequestsGatewayInstanceID, c.liveGatewaysCutoffMillis(), strconv.FormatInt(limit, 10),
 		strconv.FormatInt(runningRequestsTTL.Milliseconds(), 10), strconv.FormatInt(localRunning, 10)).Result()
 	if err != nil {
+		incAdmitFallback(admitFallbackReasonEvalError)
 		klog.V(4).ErrorS(err, "failed to atomically admit against running-requests inflight cap; falling back to local count", "key", key)
 		// After a timeout or a dropped connection the script may still have applied its +1, so
 		// keep treating it as applied: completion's one decrement then removes it. If the script
@@ -358,12 +359,14 @@ func (c *Store) admitRunningRequest(namespace, name string, limit, localRunning 
 	}
 	arr, ok := res.([]interface{})
 	if !ok || len(arr) != 2 {
+		incAdmitFallback(admitFallbackReasonBadReply)
 		klog.V(4).InfoS("unexpected running-requests admit script result shape; falling back to local count", "key", key)
 		return localRunning < limit, false, localRunning
 	}
 	admittedFlag, flagOK := arr[0].(int64)
 	running, runningOK := arr[1].(int64)
 	if !flagOK || !runningOK || (admittedFlag != 0 && admittedFlag != 1) {
+		incAdmitFallback(admitFallbackReasonBadReply)
 		klog.V(4).InfoS("unexpected running-requests admit script result values; falling back to local count", "key", key)
 		return localRunning < limit, false, localRunning
 	}
