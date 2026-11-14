@@ -17,8 +17,10 @@ limitations under the License.
 package prefixcacheindexer
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -517,4 +519,122 @@ func TestMatchPrefixInPlaceBranch(t *testing.T) {
 	assert.Equal(t, map[string]int{"ns/full": 100, "ns/late-stale": 33, "ns/one-third": 33}, matched,
 		"a holder that is stale on a later block stops matching there")
 	assert.Len(t, ready, 4, "the caller's ready-pod set must not be modified at block 0")
+}
+
+// TestPrefixHashTableRemovePrefix: removing a pod from prefix hashes clears its match.
+func TestPrefixHashTableRemovePrefix(t *testing.T) {
+	originalBlockSize := prefixCacheBlockSize
+	defer func() { prefixCacheBlockSize = originalBlockSize }()
+	prefixCacheBlockSize = 4
+
+	cache := NewPrefixHashTable()
+	const model, pod1, pod2 = "m", "ns/pod-1", "ns/pod-2"
+	tokens := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	hashes := cache.GetPrefixHashes(tokens)
+
+	cache.AddPrefix(hashes, model, pod1)
+	cache.AddPrefix(hashes, model, pod2)
+
+	readyPods := map[string]struct{}{pod1: {}, pod2: {}}
+	matched, _ := cache.MatchPrefix(tokens, model, readyPods)
+	assert.Equal(t, 100, matched[pod1])
+	assert.Equal(t, 100, matched[pod2])
+
+	// Remove pod1
+	cache.RemovePrefix(hashes, model, pod1)
+
+	matchedAfter, _ := cache.MatchPrefix(tokens, model, readyPods)
+	assert.NotContains(t, matchedAfter, pod1)
+	assert.Equal(t, 100, matchedAfter[pod2])
+}
+
+// TestPrefixHashTableRemovePrefixEdgeCases: no-op removals, model isolation and idempotence.
+func TestPrefixHashTableRemovePrefixEdgeCases(t *testing.T) {
+	originalBlockSize := prefixCacheBlockSize
+	defer func() { prefixCacheBlockSize = originalBlockSize }()
+	prefixCacheBlockSize = 4
+
+	const model, otherModel, pod1 = "m", "m2", "ns/pod-1"
+	tokens := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	readyPods := map[string]struct{}{pod1: {}}
+
+	t.Run("unknown hashes and pods are a no-op", func(t *testing.T) {
+		cache := NewPrefixHashTable()
+		hashes := cache.GetPrefixHashes(tokens)
+		// Empty input, unknown block and unknown pod must not panic or create entries.
+		cache.RemovePrefix(nil, model, pod1)
+		cache.RemovePrefix(hashes, model, pod1)
+		assert.Zero(t, cache.Len())
+
+		cache.AddPrefix(hashes, model, pod1)
+		cache.RemovePrefix([]uint64{999999}, model, pod1) // block not in store
+		cache.RemovePrefix(hashes, model, "ns/ghost")     // pod not in block
+		matched, _ := cache.MatchPrefix(tokens, model, readyPods)
+		assert.Equal(t, 100, matched[pod1], "unrelated removals must leave the entry intact")
+	})
+
+	t.Run("removal is scoped to one model", func(t *testing.T) {
+		cache := NewPrefixHashTable()
+		hashes := cache.GetPrefixHashes(tokens)
+		cache.AddPrefix(hashes, model, pod1)
+		cache.AddPrefix(hashes, otherModel, pod1)
+
+		cache.RemovePrefix(hashes, model, pod1)
+
+		matched, _ := cache.MatchPrefix(tokens, model, readyPods)
+		assert.NotContains(t, matched, pod1)
+		matchedOther, _ := cache.MatchPrefix(tokens, otherModel, readyPods)
+		assert.Equal(t, 100, matchedOther[pod1], "removing under one model must not affect another")
+	})
+
+	t.Run("removal marks blocks dirty for delta sync", func(t *testing.T) {
+		cache := NewPrefixHashTable()
+		cache.EnableDeltaSync()
+		const pod2 = "ns/pod-2"
+		hashes := cache.GetPrefixHashes(tokens)
+		cache.AddPrefix(hashes, model, pod1)
+		cache.AddPrefix(hashes, model, pod2)
+
+		// Drain and clear the AddPrefix dirt so only the removal is observed.
+		_, _, err := cache.GetDeltaForSync(context.Background())
+		assert.NoError(t, err)
+		assert.NoError(t, cache.ClearDirtyForSync(context.Background()))
+
+		cache.RemovePrefix(hashes, model, pod1)
+
+		updated, deleted, err := cache.GetDeltaForSync(context.Background())
+		assert.NoError(t, err)
+		assert.Empty(t, deleted, "deletions are never sent; removals travel as updated blocks")
+		assert.Len(t, updated, len(hashes), "every touched block is marked dirty")
+		for _, h := range hashes {
+			id := strconv.FormatUint(h, 10)
+			data, ok := updated[id]
+			if !assert.True(t, ok, "block %s pushed", id) {
+				continue
+			}
+			block, err := decodeBlock(data)
+			assert.NoError(t, err)
+			assert.NotContains(t, block.modelToPods[model], pod1)
+			assert.Contains(t, block.modelToPods[model], pod2)
+		}
+
+		// Removing a pod that is not in the block marks nothing dirty.
+		assert.NoError(t, cache.ClearDirtyForSync(context.Background()))
+		cache.RemovePrefix(hashes, model, "ns/ghost")
+		updated, _, err = cache.GetDeltaForSync(context.Background())
+		assert.NoError(t, err)
+		assert.Empty(t, updated)
+	})
+
+	t.Run("removal is idempotent", func(t *testing.T) {
+		cache := NewPrefixHashTable()
+		hashes := cache.GetPrefixHashes(tokens)
+		cache.AddPrefix(hashes, model, pod1)
+
+		cache.RemovePrefix(hashes, model, pod1)
+		cache.RemovePrefix(hashes, model, pod1)
+
+		matched, _ := cache.MatchPrefix(tokens, model, readyPods)
+		assert.NotContains(t, matched, pod1)
+	})
 }

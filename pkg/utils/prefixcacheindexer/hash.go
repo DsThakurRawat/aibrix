@@ -217,6 +217,37 @@ func (c *PrefixHashTable) AddPrefix(prefixHashes []uint64, model, pod string) {
 	}
 }
 
+// RemovePrefix removes a pod's entry for the given prefix hashes. pod is the pod key, namespace/name.
+// Under state sync (AIBRIX_STATESYNC_ENABLED) the deletion does not propagate to remote
+// replicas: they apply deltas by merging and never drop pod entries, so the removal is local
+// only.
+func (c *PrefixHashTable) RemovePrefix(prefixHashes []uint64, model, pod string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i := 0; i < len(prefixHashes); i++ {
+		prefixHash := prefixHashes[i]
+
+		block, ok := c.store.Get(prefixHash)
+		if !ok {
+			continue
+		}
+		blockPods, ok := block.modelToPods[model]
+		if !ok {
+			continue
+		}
+		if _, ok := blockPods[pod]; ok {
+			delete(blockPods, pod)
+			block.modelToPods[model] = blockPods
+			c.store.Put(prefixHash, block)
+			if c.dirtyIds != nil {
+				c.dirtySeq++
+				c.dirtyIds[strconv.FormatUint(prefixHash, 10)] = c.dirtySeq
+			}
+		}
+	}
+}
+
 // matchPods records prefixMatchPercent for the pods in alive that also hold this block, and
 // returns them: only they can match the next block. A pod last routed the block before
 // staleBefore does not count. It walks the smaller of the block's holders and alive, so a block
